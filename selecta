@@ -20,6 +20,7 @@ end
 require "optparse"
 require "io/console"
 
+KEY_CTRL_C = ?\C-c
 KEY_CTRL_N = ?\C-n
 KEY_CTRL_P = ?\C-p
 KEY_CTRL_U = ?\C-u
@@ -28,7 +29,9 @@ KEY_CTRL_W = ?\C-w
 KEY_CTRL_J = ?\C-j
 KEY_CTRL_M = ?\C-m
 KEY_DELETE = 127.chr # Equivalent to ?\C-?
-KEY_ESC    = ?\C-[
+KEY_ARR_ST = ?\C-[
+
+$arrow_state = 0
 
 class Selecta
   VERSION = [0, 0, 2]
@@ -44,15 +47,12 @@ class Selecta
       run_in_screen(config, screen, tty)
     end
 
-    if search.selection == Search::NoSelection
-      exit(1)
-    else
+    unless search.selection == Search::NoSelection
       puts search.selection
     end
   rescue ScreenValidator::NotATTY
     $stderr.puts(
       "Can't get a working TTY. Selecta requires an ANSI-compatible terminal.")
-    exit(1)
   end
 
   def run_in_screen(config, screen, tty)
@@ -73,7 +73,7 @@ class Selecta
 
   # Use the search and screen to process user actions until they quit.
   def ui_event_loop(search, screen, tty)
-    while !search.done?
+    while not search.done?
       Renderer.render!(search, screen)
       search = handle_key(search, tty.get_char)
     end
@@ -82,8 +82,28 @@ class Selecta
 
   # On each keystroke, generate a new search object
   def handle_key(search, key)
+    if $arrow_state == 1
+      if key.chr == '['
+        $arrow_state = 2
+      else
+        $arrow_state = 0
+      end
+      return search
+    elsif $arrow_state == 2
+      $arrow_state = 0
+      if key.chr == 'B'
+        return search.down
+      elsif key.chr == 'A'
+        return search.up
+      end
+      return search
+    end
+
     case key
 
+    when KEY_ARR_ST then
+      $arrow_state = 1
+      search
     when KEY_CTRL_N then search.down
     when KEY_CTRL_P then search.up
 
@@ -92,8 +112,7 @@ class Selecta
     when KEY_CTRL_H, KEY_DELETE then search.backspace
 
     when ?\r, KEY_CTRL_J, KEY_CTRL_M then search.done
-
-    when KEY_ESC then search.abort
+    when KEY_CTRL_C then raise SystemExit
 
     when /[[:print:]]/ then search.append_search_string(key.chr)
 
@@ -165,30 +184,22 @@ class Configuration < Struct.new(:visible_choices, :initial_search, :choices)
       # fixes this. I don't understand why. I found it via:
       #
       # http://stackoverflow.com/questions/2982677/ruby-1-9-invalid-byte-sequence-in-utf-8
-      if choice.valid_encoding?
-        choice
-      else
-        utf16 = choice.encode('UTF-16', 'UTF-8', :invalid => :replace, :replace => '')
-        utf16.encode('UTF-8', 'UTF-16')
-      end.strip
-    end
+      utf16 = choice.encode('UTF-16', 'UTF-8', :invalid => :replace, :replace => '')
+      utf16.encode('UTF-8', 'UTF-16')
+    end.map(&:strip)
   end
 end
 
 class Search
-  attr_reader :choices, :index, :query, :config, :matches
+  attr_reader :choices, :index, :query, :config
 
   def initialize(vars)
+    @vars = vars
     @config = vars.fetch(:config)
     @choices = vars.fetch(:choices)
     @index = vars.fetch(:index)
     @query = vars.fetch(:query)
     @done = vars.fetch(:done)
-    @aborted = vars.fetch(:aborted)
-
-    # Lazily compute matches if there aren't any
-    @matches = vars.fetch(:matches) { compute_matches }
-    @vars = vars.merge(:matches => @matches)
   end
 
   def self.blank(config)
@@ -196,48 +207,28 @@ class Search
         :choices => config.choices,
         :index => 0,
         :query => config.initial_search,
-        :done => false,
-        :aborted => false)
+        :done => false)
   end
 
-  # Construct a new Search by merging in a hash of changes.
-  def merge(changes)
-    vars = @vars.merge(changes)
-
-    # If the query changed, throw away the old matches so that new ones will be
-    # computed.
-    matches_are_stale = vars.fetch(:query) != @query
-    if matches_are_stale
-      vars = vars.reject { |key| key == :matches }
-    end
-
-    Search.new(vars)
+  def merge(vars)
+    Search.new(@vars.merge(vars))
   end
 
   def done?
-    @done || @aborted
+    @done
   end
 
   def selection
-    if @aborted
-      NoSelection
-    else
-      matches.fetch(@index) { NoSelection }
-    end
+    matches.fetch(@index) { NoSelection }
   end
 
   def down
-    index = (@index + 1) % max_visible_choices
+    index = [@index + 1, matches.count - 1, config.visible_choices - 1].min
     merge(:index => index)
   end
 
   def up
-    index = (@index - 1) % max_visible_choices
-    merge(:index => index)
-  end
-
-  def max_visible_choices
-    [@config.visible_choices, choices.count].min
+    merge(:index => [@index - 1, 0].max)
   end
 
   def append_search_string(string)
@@ -260,19 +251,9 @@ class Search
           :query => @query.sub(/[^ ]* *$/, ""))
   end
 
-  def done
-    merge(:done => true)
-  end
-
-  def abort
-    merge(:aborted => true)
-  end
-
-  private
-
-  def compute_matches
+  def matches
     @choices.map do |choice|
-      [choice, Score.score(choice, @query)]
+      [choice, Score.score(choice, query)]
     end.select do |choice, score|
       score > 0.0
     end.sort_by do |choice, score|
@@ -280,6 +261,10 @@ class Search
     end.map do |choice, score|
       choice
     end
+  end
+
+  def done
+    merge(:done => true)
   end
 
   class NoSelection; end
@@ -346,9 +331,9 @@ class Score
   end
 end
 
-class Renderer < Struct.new(:search)
+class Renderer < Struct.new(:search, :screen)
   def self.render!(search, screen)
-    rendered = Renderer.new(search).render
+    rendered = Renderer.new(search, screen).render
     start_line = screen.height - search.config.visible_choices - 1
     screen.with_cursor_hidden do
       screen.write_lines(start_line, rendered.choices)
@@ -357,11 +342,10 @@ class Renderer < Struct.new(:search)
   end
 
   def render
-    index, matches = search.index, search.matches
     search_line = "> " + search.query
+    matches = search.matches
     unless matches.empty?
-      selection_line = Text[:inverse, matches.fetch(index), :reset]
-      matches = replace_array_element(matches, index, selection_line)
+      matches[search.index] = Text[:inverse, matches.fetch(search.index), :reset]
     end
     matches = correct_match_count(matches)
     lines = [search_line] + matches
@@ -375,14 +359,6 @@ class Renderer < Struct.new(:search)
   end
 
   class Rendered < Struct.new(:choices, :search_line)
-  end
-
-  private
-
-  def replace_array_element(array, index, new_value)
-    array = array.dup
-    array[index] = new_value
-    array
   end
 end
 
@@ -411,9 +387,10 @@ class Screen
 
 
   def configure_tty
-    # -echo: terminal doesn't echo typed characters back to the terminal
-    # -icanon: terminal doesn't  interpret special characters (like backspace)
-    tty.stty("-echo -icanon")
+    # raw: Disable input and output processing
+    # -echo: Don't echo keys back
+    # cbreak: Set up lots of standard stuff, including INTR signal on ^C
+    tty.stty("raw -echo cbreak")
   end
 
   def restore_tty
@@ -473,7 +450,7 @@ class Screen
 
   def write_unrestricted(line, column, text)
     text = Text[:default, text] unless text.is_a? Text
-    write_text_object(line, column, text)
+    write_text_object(line, column,text)
   end
 
   def write_text_object(line, column, text)
@@ -664,5 +641,7 @@ if $0 == __FILE__
     Selecta.new.main
   rescue Interrupt
     exit(1)
+  rescue SystemExit
+    exit(0)
   end
 end
